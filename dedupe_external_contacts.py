@@ -1,30 +1,28 @@
 #!/usr/bin/env python3
 """
-Dedupe External Contacts Script
+Dedupe External Contacts Script with Backup
 
 This script reads a CSV file containing a pivot table of external contacts.
-It then groups contacts by email and applies a series of deduplication strategies:
-  1. If contacts have the same email and belong to the same DevRev account,
-     merge into the contact that has a CXP UID (external reference in the form "user_*").
-  2. If all contacts have a CXP UID external reference, and one was amended by the DevRev Bot,
-     merge that contact into the primary.
-  3. If contacts have the same external reference, select the primary based on either:
-     - Updated by BI service flag or
-     - Having a higher number of tickets.
-  4. If one contact is linked to a generic Upwork account and the other to a specific Upwork account,
-     mark them for merging.
-  5. If one contact is linked to "Velocity Global - OTHER", merge under the real account;
-     if more than two remain, choose the one where the external ref equals the user id.
-     
-The script supports a dry-run mode to simulate the merges without affecting production.
+It groups contacts by email and applies deduplication strategies. Before performing a merge in production,
+it backs up each contact's full details via the DevRev API (rev-users.get) to ensure data integrity.
+The script supports a dry-run mode for simulation and outputs a JSON report.
 """
 
 import csv
 import argparse
 import logging
+import json
+import os
+import requests
 from collections import defaultdict
 from datetime import datetime
 from typing import List, Dict, Tuple, Optional
+from dotenv import load_dotenv
+
+# Load environment variables from .env
+load_dotenv()
+DEVREV_BASE_URL = os.getenv("DEVREV_BASE_URL")
+DEVREV_API_TOKEN = os.getenv("DEVREV_API_TOKEN")
 
 # Configure logging
 logging.basicConfig(
@@ -33,7 +31,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("dedupe")
 
-# Define a dataclass-like structure for contacts (for simplicity, using dicts here)
 class ExternalContact:
     def __init__(self, row: Dict[str, str]):
         self.email = row.get("Email", "").strip().lower()
@@ -45,19 +42,32 @@ class ExternalContact:
         self.devrev_account_id = row.get("Devrev Account ID", "").strip()
         self.devrev_account_name = row.get("Devrev Account Name", "").strip()
         self.updated_at = row.get("Updated At", "").strip()
-        self.cxp_user_id = row.get("CXP User id", "").strip().upper()  # standardize boolean later if needed
-        self.updated_by_bi = row.get("Updated by BI service", "").strip().upper()  # "TRUE" or "FALSE"
+        self.cxp_user_id = row.get("CXP User id", "").strip().upper()
+        self.updated_by_bi = row.get("Updated by BI service", "").strip().upper()
         self.linked_to_acc = row.get("Linked to acc", "").strip()
         self.tickets = int(row.get("Tickets", "0").strip())
         self.action = row.get("Action", "").strip()
         self.strategy = row.get("Strategy", "").strip()
     
     def has_cxp_uid(self) -> bool:
-        # Assume a CXP UID starts with "user_" (as seen in sample rows)
         return self.external_ref.startswith("user_")
     
     def updated_by_bi_service(self) -> bool:
         return self.updated_by_bi == "TRUE"
+    
+    def to_dict(self) -> Dict[str, str]:
+        return {
+            "email": self.email,
+            "external_ref": self.external_ref,
+            "user_id": self.user_id,
+            "devrev_account_id": self.devrev_account_id,
+            "devrev_account_name": self.devrev_account_name,
+            "tickets": self.tickets,
+            "modified_by": self.modified_by,
+            "updated_at": self.updated_at,
+            "type": self.type,
+            "linked_to_acc": self.linked_to_acc
+        }
     
     def __repr__(self):
         return f"<Contact {self.email} | ext_ref: {self.external_ref} | acc: {self.devrev_account_id}>"
@@ -67,7 +77,6 @@ def load_contacts(csv_path: str) -> List[ExternalContact]:
     with open(csv_path, newline="", encoding="utf-8") as csvfile:
         reader = csv.DictReader(csvfile)
         for row in reader:
-            # Exclude test emails or Velocity Global (vg) emails if needed
             email = row.get("Email", "").strip().lower()
             if "test@" in email or "vg@" in email:
                 continue
@@ -86,65 +95,121 @@ def group_contacts_by_email(contacts: List[ExternalContact]) -> Dict[str, List[E
     return groups
 
 def choose_primary_contact(group: List[ExternalContact]) -> Tuple[Optional[ExternalContact], List[ExternalContact]]:
-    """
-    Given a group of contacts with the same email, apply the dedupe strategies to pick a primary
-    and return the duplicates (to be merged into the primary).
-    Strategies (simplified):
-      - Strategy 1: If at least one contact has a CXP UID and others don’t, choose the one with CXP UID.
-      - Strategy 2: If all have CXP UIDs but one was amended by DevRev Bot, choose the one not modified by Bot.
-      - Strategy 3: If external_ref values are identical, choose the one updated by BI service or with more tickets.
-      - Strategy 4 & 5: Check for special types ("Upwork", "Velocity Global - OTHER") and adjust primary accordingly.
-    """
     if not group or len(group) < 2:
         return None, []
     
     primary = None
-
-    # First, if contacts belong to different DevRev accounts, only consider those linked to the same account.
     account_groups = defaultdict(list)
     for contact in group:
         account_groups[contact.devrev_account_id].append(contact)
-    # Process each account group separately.
+    
     merge_candidates = []
     for acc, contacts_in_acc in account_groups.items():
         if len(contacts_in_acc) < 2:
-            continue  # nothing to merge in this account group
+            continue
         
-        # Strategy 1: Choose contact with CXP UID if others do not have it.
         cxp_contacts = [c for c in contacts_in_acc if c.has_cxp_uid()]
         if cxp_contacts and len(cxp_contacts) == 1:
             primary = cxp_contacts[0]
         elif cxp_contacts and len(cxp_contacts) > 1:
-            # Strategy 3: If more than one contact has CXP UID, pick the one updated by BI service or with more tickets.
             candidates = sorted(cxp_contacts, key=lambda c: (c.updated_by_bi_service(), c.tickets), reverse=True)
             primary = candidates[0]
         else:
-            # Fallback: choose the one with the highest ticket count.
             primary = max(contacts_in_acc, key=lambda c: c.tickets)
         
-        # Special strategy for Upwork
         if any("upwork" in c.type.lower() for c in contacts_in_acc):
-            # If one contact is generic and one is specific, choose the specific one.
             specific = [c for c in contacts_in_acc if "upwork" in c.external_ref.lower()]
             if specific:
                 primary = specific[0]
         
-        # Special strategy for Velocity Global - OTHER:
         if any("velocity global - other" in c.devrev_account_name.lower() for c in contacts_in_acc):
             real_accounts = [c for c in contacts_in_acc if c.external_ref == c.user_id]
             if real_accounts:
                 primary = real_accounts[0]
         
-        # Determine duplicates (all other contacts in this account group)
         duplicates = [c for c in contacts_in_acc if c != primary]
         merge_candidates.extend([(primary, dup) for dup in duplicates])
     
     return primary, merge_candidates
 
+def backup_contact(contact: ExternalContact) -> bool:
+    """
+    Backup the full contact details using the DevRev API (rev-users.get) and save it as a JSON file.
+    """
+    backup_endpoint = "/rev-users/get"
+    url = f"{DEVREV_BASE_URL.rstrip('/')}{backup_endpoint}"
+    payload = {"id": contact.user_id}
+    headers = {
+        "Authorization": f"Bearer {DEVREV_API_TOKEN}",
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+    try:
+        response = requests.post(url, json=payload, headers=headers, timeout=10)
+        response.raise_for_status()
+        backup_data = response.json()
+        
+        backup_dir = "backups"
+        os.makedirs(backup_dir, exist_ok=True)
+        backup_filename = os.path.join(
+            backup_dir,
+            f"backup_{contact.user_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        )
+        with open(backup_filename, "w", encoding="utf-8") as f:
+            json.dump(backup_data, f, indent=2)
+        logger.info(f"Backup saved for contact {contact.user_id} at {backup_filename}")
+        return True
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"HTTP error during backup for {contact.user_id}: {e.response.status_code} - {e.response.text}")
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error during backup for {contact.user_id}: {str(e)}")
+    return False
+
+def perform_merge(primary: ExternalContact, duplicate: ExternalContact) -> bool:
+    """
+    Call the DevRev merge API endpoint to merge the duplicate into the primary contact.
+    """
+    merge_endpoint = "/rev-users/merge"
+    url = f"{DEVREV_BASE_URL.rstrip('/')}{merge_endpoint}"
+    payload = {
+        "primary_user": primary.user_id,
+        "secondary_user": duplicate.user_id
+    }
+    headers = {
+        "Authorization": f"Bearer {DEVREV_API_TOKEN}",
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+    try:
+        response = requests.post(url, json=payload, headers=headers, timeout=10)
+        response.raise_for_status()
+        logger.info(f"Merge successful: {primary.external_ref} <== {duplicate.external_ref}")
+        return True
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"HTTP error during merge: {e.response.status_code} - {e.response.text}")
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error during merge: {str(e)}")
+    return False
+
+def save_merge_report(merge_actions: List[Tuple[ExternalContact, ExternalContact]]) -> None:
+    report = {
+        "timestamp": datetime.now().isoformat(),
+        "total_merge_actions": len(merge_actions),
+        "merge_actions": []
+    }
+    for primary, duplicate in merge_actions:
+        report["merge_actions"].append({
+            "primary": primary.to_dict(),
+            "duplicate": duplicate.to_dict()
+        })
+    report_filename = f"dedupe_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    with open(report_filename, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2)
+    logger.info(f"Structured report saved to {report_filename}")
+
 def dedupe_contacts(contacts: List[ExternalContact], dry_run: bool) -> None:
     groups = group_contacts_by_email(contacts)
     merge_actions = []  # List of tuples (primary, duplicate)
-
     for email, group in groups.items():
         if len(group) < 2:
             continue
@@ -152,21 +217,25 @@ def dedupe_contacts(contacts: List[ExternalContact], dry_run: bool) -> None:
         merge_actions.extend(merges)
     
     logger.info(f"Identified {len(merge_actions)} merge actions.")
-
-    # Process merge actions
+    
     for primary, duplicate in merge_actions:
         logger.info(f"Merge Action: Merge duplicate {duplicate.external_ref} (Account: {duplicate.devrev_account_id}) into primary {primary.external_ref}")
         if not dry_run:
-            # Here, you would call the DevRev API merge endpoint.
-            # For example:
-            # success = devrev_api.merge_contacts(primary.rev_user_id, duplicate.rev_user_id)
-            # if success:
-            #     logger.info("Merge succeeded.")
-            # else:
-            #     logger.error("Merge failed.")
-            logger.info("Performing merge (this would call the production API).")
+            # Backup primary and duplicate before merging
+            if not backup_contact(primary):
+                logger.error(f"Backup failed for primary {primary.user_id}. Skipping merge for this pair.")
+                continue
+            if not backup_contact(duplicate):
+                logger.error(f"Backup failed for duplicate {duplicate.user_id}. Skipping merge for this pair.")
+                continue
+            
+            success = perform_merge(primary, duplicate)
+            if not success:
+                logger.error("Merge failed for this pair.")
         else:
             logger.info("Dry run mode: No merge performed.")
+    
+    save_merge_report(merge_actions)
 
 def main():
     parser = argparse.ArgumentParser(
